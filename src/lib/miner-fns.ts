@@ -1,6 +1,7 @@
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServerFn } from "@tanstack/react-start";
 import { getSql } from "@/lib/db";
+import { changeState, isNetlifyStore, readState } from "@/lib/miner-blob";
 import {
   BASE_RATE,
   CHAIN_ID,
@@ -75,6 +76,7 @@ async function ensureInstalled() {
 }
 
 async function settings() {
+  if (isNetlifyStore()) return (await readState()).settings;
   await ensureInstalled();
   const sql = await getSql();
   const rows = await sql<SettingsRow>`
@@ -95,6 +97,10 @@ async function requirePin(pin: string) {
 }
 
 async function readMiner(secret: string) {
+  if (isNetlifyStore()) {
+    const state = await readState();
+    return state.miners.find((miner) => miner.secret === secret) ?? null;
+  }
   const sql = await getSql();
   const rows = await sql<MinerRow>`
     select
@@ -130,6 +136,20 @@ async function settle(row: MinerRow) {
   }
   const balance = round6(row.balance + earned);
   const lifetime = round6(row.lifetime_mined + earned);
+  const capped = until && until > now + 86_400_000 ? now + 86_400_000 : until;
+  if (isNetlifyStore()) {
+    await changeState((state) => {
+      const miner = state.miners.find((item) => item.id === row.id);
+      if (!miner) return;
+      if (earned > 0 || now - anchor > 1000) {
+        miner.balance = balance;
+        miner.lifetime_mined = lifetime;
+        miner.accrual_ms = now;
+      }
+      if (capped && until && capped < until) miner.electricity_until_ms = capped;
+    });
+    return { ...row, balance, lifetime_mined: lifetime, accrual_ms: now, electricity_until_ms: capped };
+  }
   if (earned > 0 || now - anchor > 1000) {
     const sql = await getSql();
     await sql`
@@ -140,19 +160,35 @@ async function settle(row: MinerRow) {
       where id = ${row.id}
     `;
   }
-  const capped = until && until > now + 86_400_000 ? now + 86_400_000 : until;
-  if (capped && until && capped < until) {
+  const cappedSql = until && until > now + 86_400_000 ? now + 86_400_000 : until;
+  if (cappedSql && until && cappedSql < until) {
     const sql = await getSql();
     await sql`
       update miners
-      set electricity_until = to_timestamp(${capped} / 1000.0)
+      set electricity_until = to_timestamp(${cappedSql} / 1000.0)
       where id = ${row.id}
     `;
   }
-  return { ...row, balance, lifetime_mined: lifetime, accrual_ms: now, electricity_until_ms: capped };
+  return { ...row, balance, lifetime_mined: lifetime, accrual_ms: now, electricity_until_ms: cappedSql };
 }
 
 async function withdrawalsFor(minerId: string) {
+  if (isNetlifyStore()) {
+    const state = await readState();
+    return state.withdrawals
+      .filter((row) => row.minerId === minerId)
+      .sort((a, b) => b.id - a.id)
+      .slice(0, 8)
+      .map((row) => ({
+        id: row.id,
+        handle: row.handle,
+        address: row.address,
+        amount: row.amount,
+        status: row.status,
+        txHash: row.txHash,
+        createdAt: row.createdAt,
+      }));
+  }
   const sql = await getSql();
   const rows = await sql<{
     id: number;
@@ -294,10 +330,68 @@ export const startChallenge = createServerFn({ method: "POST" }).handler(async (
   let code = "BID-";
   for (let i = 0; i < 4; i += 1) code += alphabet[bytes[i]! % alphabet.length];
   const id = randomUUID();
+  if (isNetlifyStore()) {
+    await changeState((state) => {
+      state.challenges.push({ id, code, used: false, createdAt: Date.now() });
+    });
+    return { id, code };
+  }
   const sql = await getSql();
   await sql`insert into miner_challenges (id, code) values (${id}, ${code})`;
   return { id, code };
 });
+
+async function verifyOnNetlify(
+  challengeId: string,
+  postUrl: string,
+  parsed: { handle: string; id: string },
+) {
+  const state = await readState();
+  const challenge = state.challenges.find((item) => item.id === challengeId);
+  const ageHours = challenge ? (Date.now() - challenge.createdAt) / 3_600_000 : 99;
+  if (!challenge || challenge.used || ageHours > 12) {
+    return { ok: false as const, error: "That code expired. Generate a new one and post it." };
+  }
+  const tweet = await readTweet(parsed.id);
+  if (tweet && !tweet.toUpperCase().includes(challenge.code.toUpperCase())) {
+    return {
+      ok: false as const,
+      error: `That post does not include ${challenge.code}. Post the code, then paste that exact link.`,
+    };
+  }
+  const checked = Boolean(tweet);
+  const anchor = tweet ? tweet.slice(0, 220) : "";
+  const secret = randomBytes(24).toString("hex");
+  await changeState((next) => {
+    const found = next.miners.find((miner) => miner.x_handle.toLowerCase() === parsed.handle.toLowerCase());
+    if (found) {
+      found.secret = secret;
+      found.post_url = postUrl;
+      found.anchor_post = anchor;
+      found.post_checked = checked;
+      found.x_handle = parsed.handle;
+    } else {
+      next.miners.push({
+        id: randomUUID(),
+        secret,
+        x_handle: parsed.handle,
+        post_url: postUrl,
+        anchor_post: anchor,
+        post_checked: checked,
+        balance: 0,
+        lifetime_mined: 0,
+        gpu: false,
+        withdraw_address: "",
+        electricity_until_ms: null,
+        accrual_ms: Date.now(),
+      });
+    }
+    const row = next.challenges.find((item) => item.id === challenge.id);
+    if (row) row.used = true;
+  });
+  const view = await present(secret);
+  return { ok: true as const, secret, checked, view };
+}
 
 export const verifyPost = createServerFn({ method: "POST" })
   .validator((input: { challengeId: string; postUrl: string }) => {
@@ -311,6 +405,7 @@ export const verifyPost = createServerFn({ method: "POST" })
     if (!parsed) {
       return { ok: false as const, error: "That is not an X post link. Copy the status URL from your post." };
     }
+    if (isNetlifyStore()) return verifyOnNetlify(data.challengeId, data.postUrl, parsed);
     const sql = await getSql();
     const challenges = await sql<{ id: string; code: string; used: boolean; age_hours: number }>`
       select id, code, used, (extract(epoch from (now() - created_at)) / 3600)::float8 as age_hours
@@ -381,6 +476,27 @@ async function activate(
   const found = await readMiner(secret);
   if (!found) return { ok: false, error: "Session ended. Link X again." };
   await settle(found);
+  if (isNetlifyStore()) {
+    if (mode === "power") {
+      const fresh = await readMiner(secret);
+      const now = Date.now();
+      if ((fresh?.electricity_until_ms ?? 0) > now) {
+        return { ok: false, error: "Electricity is still on. Buy again only after this 24 hours runs out." };
+      }
+      await changeState((state) => {
+        const miner = state.miners.find((item) => item.secret === secret);
+        if (miner) miner.electricity_until_ms = now + 86_400_000;
+      });
+    } else {
+      await changeState((state) => {
+        const miner = state.miners.find((item) => item.secret === secret);
+        if (miner) miner.gpu = true;
+      });
+    }
+    const view = await present(secret);
+    if (!view) return { ok: false, error: "Session ended. Link X again." };
+    return { ok: true, view };
+  }
   const sql = await getSql();
   if (mode === "power") {
     const fresh = await readMiner(secret);
@@ -430,6 +546,37 @@ export const withdrawCoins = createServerFn({ method: "POST" })
     const row = await settle(found);
     if (data.amount - row.balance > 0.000001) {
       return { ok: false as const, error: "That is more than you have mined." };
+    }
+    if (isNetlifyStore()) {
+      const saved = await changeState((state) => {
+        const miner = state.miners.find((item) => item.secret === data.secret);
+        if (!miner || miner.balance + 0.000001 < data.amount) return "short-balance" as const;
+        if (state.settings.pool_balance + 0.000001 < data.amount) return "short-pool" as const;
+        miner.balance = round6(miner.balance - data.amount);
+        miner.withdraw_address = data.address;
+        state.settings.pool_balance = round6(state.settings.pool_balance - data.amount);
+        state.withdrawals.push({
+          id: state.nextWithdrawalId,
+          minerId: miner.id,
+          handle: row.x_handle,
+          address: data.address,
+          amount: data.amount,
+          status: "queued",
+          txHash: null,
+          createdAt: new Date().toISOString(),
+        });
+        state.nextWithdrawalId += 1;
+        return "ok" as const;
+      });
+      if (saved === "short-balance") return { ok: false as const, error: "Balance changed. Try that amount again." };
+      if (saved === "short-pool") {
+        return {
+          ok: false as const,
+          error: "The $MINERTEST pool is short. Open the pool desk and add coins before this withdrawal can clear.",
+        };
+      }
+      const view = await present(data.secret);
+      return { ok: true as const, view };
     }
     const sql = await getSql();
     const taken = await sql<{ id: string }>`
@@ -522,6 +669,38 @@ export const confirmDeposit = createServerFn({ method: "POST" })
       return { ok: false as const, error: "The live coin is not installed yet." };
     }
     const hash = data.txHash.toLowerCase();
+    if (isNetlifyStore()) {
+      const prior = (await readState()).deposits.find((item) => item.txHash === hash);
+      if (prior) {
+        if (prior.minerId !== found.id) {
+          return { ok: false as const, error: "That transfer was already credited to another miner." };
+        }
+        const view = await present(data.secret);
+        return { ok: true as const, view, already: true as const };
+      }
+      let receipt: Receipt | null;
+      try {
+        receipt = (await rpc<Receipt | null>("eth_getTransactionReceipt", [hash])) ?? null;
+      } catch (error) {
+        return { ok: false as const, error: error instanceof Error ? error.message : "Could not read that transaction." };
+      }
+      if (!receipt) {
+        return { ok: false as const, error: "That transaction is not confirmed yet. Wait a few seconds and try the same hash again." };
+      }
+      const parsed = depositFromReceipt(receipt, cfg.token_address, cfg.pool_wallet);
+      if (!parsed || parsed.amount <= 0) {
+        return { ok: false as const, error: `That transaction did not send $${TICKER} to the pool wallet.` };
+      }
+      await changeState((state) => {
+        if (state.deposits.some((item) => item.txHash === hash)) return;
+        state.deposits.push({ txHash: hash, minerId: found.id, from: parsed.from, amount: parsed.amount });
+        const miner = state.miners.find((item) => item.id === found.id);
+        if (miner) miner.balance = round6(miner.balance + parsed.amount);
+        state.settings.pool_balance = round6(state.settings.pool_balance + parsed.amount);
+      });
+      const view = await present(data.secret);
+      return { ok: true as const, view, amount: parsed.amount };
+    }
     const sql = await getSql();
     const prior = await sql<{ miner_id: string }>`
       select miner_id from miner_deposits where tx_hash = ${hash}
@@ -583,22 +762,38 @@ async function buildAdmin(pin: string): Promise<{ ok: true; view: AdminView } | 
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : "Wrong pool pin." };
   }
-  const sql = await getSql();
-  const withdrawals = await sql<{
-    id: number;
-    x_handle: string;
-    address: string;
-    amount: number;
-    status: string;
-    tx_hash: string | null;
-    created_at: string;
-  }>`
+  const sql = isNetlifyStore() ? null : await getSql();
+  const withdrawals = isNetlifyStore()
+    ? (await readState()).withdrawals
+        .slice()
+        .sort((a, b) => b.id - a.id)
+        .slice(0, 20)
+        .map((row) => ({
+          id: row.id,
+          x_handle: row.handle,
+          address: row.address,
+          amount: row.amount,
+          status: row.status,
+          tx_hash: row.txHash,
+          created_at: row.createdAt,
+        }))
+    : await sql!<{
+        id: number;
+        x_handle: string;
+        address: string;
+        amount: number;
+        status: string;
+        tx_hash: string | null;
+        created_at: string;
+      }>`
     select id, x_handle, address, amount::float8 as amount, status, tx_hash, created_at::text as created_at
     from miner_withdrawals
     order by id desc
     limit 20
   `;
-  const counts = await sql<{ miners: number }>`select count(*)::float8 as miners from miners`;
+  const counts = isNetlifyStore()
+    ? [{ miners: (await readState()).miners.length }]
+    : await sql!< { miners: number }>`select count(*)::float8 as miners from miners`;
   const chain = await onChainBalance(cfg.token_address, cfg.pool_wallet);
   return {
     ok: true,
@@ -630,6 +825,12 @@ export const adminAddPool = createServerFn({ method: "POST" })
     if (!Number.isFinite(data.amount) || data.amount <= 0) {
       return { ok: false as const, error: "Enter a positive amount of $MINERTEST to add." };
     }
+    if (isNetlifyStore()) {
+      await changeState((state) => {
+        state.settings.pool_balance = round6(state.settings.pool_balance + data.amount);
+      });
+      return buildAdmin(data.pin);
+    }
     const sql = await getSql();
     await sql`
       update miner_settings
@@ -658,6 +859,32 @@ export const adminCreditPool = createServerFn({ method: "POST" })
       return { ok: false as const, error: "The live coin is not installed yet." };
     }
     const hash = data.txHash.toLowerCase();
+    if (isNetlifyStore()) {
+      if ((await readState()).deposits.some((item) => item.txHash === hash)) {
+        return { ok: false as const, error: "That transfer was already added to the pool." };
+      }
+      let receipt: Receipt | null;
+      try {
+        receipt = (await rpc<Receipt | null>("eth_getTransactionReceipt", [hash])) ?? null;
+      } catch (error) {
+        return { ok: false as const, error: error instanceof Error ? error.message : "Could not read that transaction." };
+      }
+      if (!receipt) {
+        return { ok: false as const, error: "That transaction is not confirmed yet. Wait a few seconds and try the same hash again." };
+      }
+      const parsed = depositFromReceipt(receipt, cfg.token_address, cfg.pool_wallet);
+      if (!parsed || parsed.amount <= 0) {
+        return { ok: false as const, error: `That transaction did not send $${TICKER} to the pool wallet.` };
+      }
+      const inserted = await changeState((state) => {
+        if (state.deposits.some((item) => item.txHash === hash)) return false;
+        state.deposits.push({ txHash: hash, minerId: "pool", from: parsed.from, amount: parsed.amount });
+        state.settings.pool_balance = round6(state.settings.pool_balance + parsed.amount);
+        return true;
+      });
+      if (!inserted) return { ok: false as const, error: "That transfer was already added to the pool." };
+      return buildAdmin(data.pin);
+    }
     const sql = await getSql();
     const prior = await sql<{ tx_hash: string }>`select tx_hash from miner_deposits where tx_hash = ${hash}`;
     if (prior[0]) return { ok: false as const, error: "That transfer was already added to the pool." };
@@ -711,6 +938,14 @@ export const adminSaveCoin = createServerFn({ method: "POST" })
     if (data.pinNext && data.pinNext.length < 4) {
       return { ok: false as const, error: "New pin needs at least 4 characters." };
     }
+    if (isNetlifyStore()) {
+      await changeState((state) => {
+        state.settings.token_address = data.tokenAddress;
+        state.settings.pool_wallet = data.poolWallet;
+        state.settings.admin_pin = data.pinNext || data.pin;
+      });
+      return buildAdmin(data.pinNext || data.pin);
+    }
     const sql = await getSql();
     await sql`
       update miner_settings
@@ -736,6 +971,15 @@ export const adminMarkSent = createServerFn({ method: "POST" })
       return { ok: false as const, error: error instanceof Error ? error.message : "Wrong pool pin." };
     }
     if (!Number.isFinite(data.id)) return { ok: false as const, error: "Missing withdrawal." };
+    if (isNetlifyStore()) {
+      await changeState((state) => {
+        const row = state.withdrawals.find((item) => item.id === data.id);
+        if (!row) return;
+        row.status = "sent";
+        row.txHash = data.txHash || null;
+      });
+      return buildAdmin(data.pin);
+    }
     const sql = await getSql();
     await sql`
       update miner_withdrawals
