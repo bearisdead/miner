@@ -1,0 +1,12 @@
+Bear is Dead mobile miner. Upload this whole folder to your Netlify account.
+
+In Netlify: Add new site, import this project, build command npm run build, Node 22.
+Set an environment variable named DATABASE_URL to a Postgres connection string or the miner forgets people when the site sleeps.
+
+Deposit address for $MINERTEST withdrawals:
+0x92C2f3324681BAb5edC77cedFF427ba818ec773D
+
+Token:
+0xD2b80F2a2c8aE73c10F4822AA2D955cBb6aB22d7
+
+Admin pin: 4663
